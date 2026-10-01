@@ -32,7 +32,7 @@ export async function parseStatementPDF(
         transactions: [],
         totalPages: 0,
         errors: [
-          "This PDF appears to be password-protected. Please remove the password and re-upload.",
+          "This PDF statement appears to be password-protected. Please remove the password and re-upload.",
         ],
       };
     }
@@ -48,7 +48,7 @@ export async function parseStatementPDF(
       transactions: [],
       totalPages,
       errors: [
-        "No readable text found in this PDF. It may be a scanned image or empty. Please upload an official digital e-statement or CSV.",
+        "No readable digital text found in this PDF. It may be a scanned image or photo. Please upload an official electronic e-statement or CSV.",
       ],
     };
   }
@@ -61,10 +61,10 @@ export async function parseStatementPDF(
   const transactions: Transaction[] = [];
   const seenSignatures = new Set<string>();
 
-  // Date regex: e.g. 12/04/2024 or 12-04-2024 or 12 Apr 2024
-  const dateRegex = /\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{2,4})\b/i;
-  // Amount regex: numbers with optional commas and decimals, e.g. 1,450.00 or 250.00
-  const amountRegex = /(?:₹|Rs\.?|INR)?\s*(\d{1,3}(?:,\d{2,3})*(?:\.\d{2})|\d+(?:\.\d{2}))/g;
+  // Date regex supporting DD/MM/YYYY, DD-MM-YYYY, DD.MM.YYYY, and DD-Mon-YYYY
+  const dateRegex = /\b(\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{1,2}[\s./-]+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[\s./-]+\d{2,4})\b/i;
+  // Amount regex supporting ₹, Rs, INR, comma separators, optional decimals
+  const amountRegex = /(?:₹|Rs\.?|INR)?\s*(\d{1,3}(?:,\d{2,3})+(?:\.\d{2})?|\d{2,7}(?:\.\d{2})?)/g;
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
@@ -75,11 +75,9 @@ export async function parseStatementPDF(
       const normalizedDate = parseIndianDate(rawDate);
       if (!normalizedDate) continue;
 
-      // Check if amount is present on this line or next line
       let lineToSearch = line;
       let extraDesc = "";
       if (i + 1 < lines.length && !lines[i + 1].match(dateRegex)) {
-        // Look ahead 1-2 lines for description or amount
         lineToSearch += " " + lines[i + 1];
         extraDesc = lines[i + 1];
         if (i + 2 < lines.length && !lines[i + 2].match(dateRegex)) {
@@ -92,15 +90,14 @@ export async function parseStatementPDF(
       let match: RegExpExecArray | null;
       while ((match = amountRegex.exec(lineToSearch)) !== null) {
         const val = parseFloat(match[1].replace(/,/g, ""));
-        if (!isNaN(val) && val > 0 && val < 50000000) {
+        if (!isNaN(val) && val >= 1 && val < 50000000) {
           amountsFound.push(val);
         }
       }
 
       if (amountsFound.length === 0) continue;
 
-      // Determine amount: Usually transaction amount is before balance
-      // If 2 amounts, first is transaction amount, second is closing balance
+      // In statements with transaction and balance columns, first is txn amount
       const amount = amountsFound[0];
 
       // Determine debit or credit
