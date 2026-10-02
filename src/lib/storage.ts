@@ -89,7 +89,7 @@ export async function saveStatement(statement: Statement): Promise<Statement> {
 
   if (isSupabaseConfigured && supabase && isUUID(statement.user_id)) {
     const dbRecord = cleanStatementForDb(statement);
-    console.log(`[DATABASE PERSISTENCE] Upserting statement record: ${dbRecord.id} for user: ${dbRecord.user_id}`);
+    console.log(`[DATABASE PERSISTENCE] Upserting statement record: ${dbRecord.id} for user: ${statement.user_id}`);
 
     const { data, error } = await supabase
       .from("statements")
