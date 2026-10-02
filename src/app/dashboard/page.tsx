@@ -33,6 +33,7 @@ import {
   FileText,
   AlertCircle,
   PlusCircle,
+  Loader2,
 } from "lucide-react";
 
 export default function DashboardPage() {
@@ -45,21 +46,31 @@ export default function DashboardPage() {
   const [loadingData, setLoadingData] = useState(true);
   const [loadingAI, setLoadingAI] = useState(false);
   const [isAskAIOpen, setIsAskAIOpen] = useState(false);
+  const [dbError, setDbError] = useState<string | null>(null);
+
+  const loadData = async () => {
+    if (!user) return;
+    setLoadingData(true);
+    setDbError(null);
+    try {
+      console.log(`[DASHBOARD FETCH] Querying database for user: ${user.id}`);
+      const stmts = await fetchStatements(user.id);
+      const txs = await fetchTransactions(user.id);
+      console.log(`[DASHBOARD FETCH] Found ${stmts.length} statement(s) and ${txs.length} transaction(s) in database.`);
+      setStatements(stmts);
+      setTransactions(txs);
+    } catch (err: unknown) {
+      console.error("[DASHBOARD FETCH ERROR] Database query failed:", err);
+      setDbError(err instanceof Error ? err.message : "Failed to retrieve statement data from database.");
+    } finally {
+      setLoadingData(false);
+    }
+  };
 
   useEffect(() => {
     if (!authLoading && !user) {
       router.push("/login");
       return;
-    }
-
-    async function loadData() {
-      if (!user) return;
-      setLoadingData(true);
-      const stmts = await fetchStatements(user.id);
-      const txs = await fetchTransactions(user.id);
-      setStatements(stmts);
-      setTransactions(txs);
-      setLoadingData(false);
     }
 
     if (user) {
@@ -117,7 +128,7 @@ export default function DashboardPage() {
     return "Good evening";
   }, []);
 
-  if (authLoading || (loadingData && !transactions.length)) {
+  if (authLoading || (loadingData && !transactions.length && !dbError)) {
     return (
       <div className="min-h-screen bg-[#080B13] flex items-center justify-center text-slate-400">
         <div className="flex flex-col items-center gap-3">
@@ -127,6 +138,10 @@ export default function DashboardPage() {
       </div>
     );
   }
+
+  const isProcessing = statements.some(
+    (s) => s.processing_status === "processing" || s.processing_status === "uploading"
+  );
 
   return (
     <div className="min-h-screen flex flex-col bg-[#080B13] text-slate-100">
@@ -176,8 +191,48 @@ export default function DashboardPage() {
           </div>
         </div>
 
-        {/* Empty State: No Transactions Found */}
-        {transactions.length === 0 ? (
+        {/* Database Error Banner */}
+        {dbError ? (
+          <div className="glass-panel rounded-3xl p-8 max-w-xl mx-auto my-12 border border-rose-500/30 text-center">
+            <div className="w-12 h-12 rounded-2xl bg-rose-500/10 border border-rose-500/20 flex items-center justify-center text-rose-400 mx-auto mb-4">
+              <AlertCircle className="w-6 h-6" />
+            </div>
+            <h3 className="text-base font-bold text-white mb-2">Database Query Error</h3>
+            <p className="text-xs text-rose-300 mb-6 leading-relaxed max-w-md mx-auto">{dbError}</p>
+            <div className="flex items-center justify-center gap-3">
+              <button
+                onClick={loadData}
+                className="px-5 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs flex items-center gap-2 shadow-lg shadow-emerald-500/20 transition-all cursor-pointer"
+              >
+                <span>Retry Database Connection</span>
+              </button>
+              <Link
+                href="/upload"
+                className="px-5 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold text-xs transition-colors"
+              >
+                Re-upload Statement
+              </Link>
+            </div>
+          </div>
+        ) : isProcessing && transactions.length === 0 ? (
+          /* Processing State */
+          <div className="glass-panel rounded-3xl p-10 sm:p-14 text-center max-w-2xl mx-auto my-12 border border-emerald-500/30">
+            <div className="w-14 h-14 rounded-2xl bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center text-emerald-400 mx-auto mb-5">
+              <Loader2 className="w-7 h-7 animate-spin" />
+            </div>
+            <h2 className="text-xl font-bold text-white mb-2">Statement Analysis In Progress</h2>
+            <p className="text-xs text-slate-400 max-w-md mx-auto mb-7 leading-relaxed">
+              Your statement is being processed. Normalization, categorization, and aggregate calculations are underway.
+            </p>
+            <button
+              onClick={loadData}
+              className="px-5 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs cursor-pointer"
+            >
+              Refresh Status
+            </button>
+          </div>
+        ) : statements.length === 0 && transactions.length === 0 ? (
+          /* Empty State: Only when database confirms zero statements exist */
           <div className="glass-panel rounded-3xl p-10 sm:p-14 text-center max-w-2xl mx-auto my-12 border border-slate-800">
             <div className="w-16 h-16 rounded-2xl bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center text-emerald-400 mx-auto mb-5">
               <UploadCloud className="w-8 h-8" />
@@ -196,10 +251,12 @@ export default function DashboardPage() {
               <button
                 onClick={async () => {
                   await loginAsDemoUser();
-                  const txs = await fetchTransactions(user!.id);
-                  setTransactions(txs);
+                  const demoUserStmts = await fetchStatements("demo-user-sagar");
+                  const demoUserTxs = await fetchTransactions("demo-user-sagar");
+                  setStatements(demoUserStmts);
+                  setTransactions(demoUserTxs);
                 }}
-                className="w-full sm:w-auto px-6 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-700 font-semibold text-xs transition-colors"
+                className="w-full sm:w-auto px-6 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-700 font-semibold text-xs transition-colors cursor-pointer"
               >
                 Load Sample PhonePe Data
               </button>

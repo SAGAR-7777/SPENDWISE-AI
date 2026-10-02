@@ -64,6 +64,27 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
 
     initAuth();
+
+    if (isSupabaseConfigured && supabase) {
+      const {
+        data: { subscription },
+      } = supabase.auth.onAuthStateChange((_event, session) => {
+        if (session?.user) {
+          const u: User = {
+            id: session.user.id,
+            email: session.user.email || "",
+            name: session.user.user_metadata?.name || session.user.email?.split("@")[0] || "User",
+          };
+          setUser(u);
+          if (typeof window !== "undefined") {
+            localStorage.setItem(LOCAL_SESSION_KEY, JSON.stringify(u));
+          }
+        }
+      });
+      return () => {
+        subscription.unsubscribe();
+      };
+    }
   }, []);
 
   const login = async (email: string, pass: string) => {
@@ -84,6 +105,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           name: data.user.user_metadata?.name || email.split("@")[0],
         };
         setUser(u);
+        if (typeof window !== "undefined") {
+          localStorage.setItem(LOCAL_SESSION_KEY, JSON.stringify(u));
+        }
         setLoading(false);
         return { success: true };
       }
@@ -130,6 +154,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           name,
         };
         setUser(u);
+        if (typeof window !== "undefined") {
+          localStorage.setItem(LOCAL_SESSION_KEY, JSON.stringify(u));
+        }
         setLoading(false);
         return { success: true };
       }

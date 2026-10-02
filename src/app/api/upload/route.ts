@@ -35,7 +35,8 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const statementId = crypto.randomUUID();
+    const statementId = (formData.get("statementId") as string) || crypto.randomUUID();
+    console.log(`[UPLOAD] File received: "${file.name}" (${(file.size / 1024).toFixed(1)} KB), User ID: ${userId}, Statement ID: ${statementId}`);
 
     if (isCSV) {
       const text = await file.text();
@@ -52,6 +53,9 @@ export async function POST(req: NextRequest) {
           { status: 422 }
         );
       }
+
+      console.log(`[EXTRACTION COMPLETE] Extracted ${parsed.transactions.length} rows from CSV`);
+      console.log(`[TRANSACTIONS NORMALIZED] Normalized ${parsed.transactions.length} transactions for statement ${statementId}`);
 
       const statement: Statement = {
         id: statementId,
@@ -72,6 +76,8 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({
         statement,
         transactions: parsed.transactions,
+        periodStart: parsed.periodStart,
+        periodEnd: parsed.periodEnd,
         errors: parsed.errors,
       });
     }
@@ -92,6 +98,9 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    console.log(`[EXTRACTION COMPLETE] Extracted ${parsed.transactions.length} rows from PDF`);
+    console.log(`[TRANSACTIONS NORMALIZED] Normalized ${parsed.transactions.length} transactions for statement ${statementId}`);
+
     const statement: Statement = {
       id: statementId,
       user_id: userId,
@@ -111,11 +120,13 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({
       statement,
       transactions: parsed.transactions,
+      periodStart: parsed.periodStart,
+      periodEnd: parsed.periodEnd,
       totalPages: parsed.totalPages,
       errors: parsed.errors,
     });
   } catch (err: unknown) {
-    console.error("Statement upload error:", err);
+    console.error("[PIPELINE ERROR] Statement upload processing error:", err);
     return NextResponse.json(
       { error: "An unexpected error occurred while processing the statement. Please try again." },
       { status: 500 }

@@ -3,15 +3,20 @@
 import { useState, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/context/auth-context";
-import { saveStatement, saveTransactionsBatch } from "@/lib/storage";
+import { saveStatement, saveTransactionsBatch, updateStatementStatus } from "@/lib/storage";
+import {
+  calculateFinancialSummary,
+  calculateCategorySpending,
+  detectPotentiallyReducibleSpending,
+  detectRecurringPayments,
+} from "@/lib/analytics";
+import { Statement } from "@/types";
 import {
   UploadCloud,
   FileText,
   CheckCircle,
   AlertCircle,
   Loader2,
-  Download,
-  ArrowRight,
   Shield,
   FileSpreadsheet,
 } from "lucide-react";
@@ -40,7 +45,7 @@ const STAGES: StageInfo[] = [
   { id: "extracting", label: "Extracting transaction rows & UPI tags" },
   { id: "cleaning", label: "Cleaning data & normalizing dates/amounts" },
   { id: "categorizing", label: "Categorizing merchants with Indian entity rules" },
-  { id: "calculating", label: "Calculating financial aggregates & recurring patterns" },
+  { id: "calculating", label: "Persisting transactions & calculating financial aggregates" },
   { id: "generating", label: "Generating verified AI detective insights" },
   { id: "complete", label: "Complete! Redirecting to command center" },
 ];
@@ -95,56 +100,122 @@ export function StatementUploader() {
   };
 
   const processFile = async (file: File) => {
+    // 1. [AUTH] VERIFICATION
+    if (!user || !user.id) {
+      console.error("[AUTH] Verification failed: No authenticated user present at upload time!");
+      setStage("error");
+      setErrorMessage("You must be signed in to upload and analyze statements.");
+      return;
+    }
+
+    const authenticatedUserId = user.id;
+    console.log(`[UPLOAD] Starting file ingestion for: "${file.name}" (${(file.size / 1024).toFixed(1)} KB, type: ${file.type || "unknown"})`);
+    console.log(`[AUTH] Authenticated user ID verified: ${authenticatedUserId}`);
+
     setSelectedFile(file);
     setErrorMessage(null);
     setStage("uploading");
 
-    const formData = new FormData();
-    formData.append("file", file);
-    formData.append("userId", user?.id || "local-user");
+    const statementId = crypto.randomUUID();
+    const isPDF = file.name.toLowerCase().endsWith(".pdf") || file.type === "application/pdf";
 
     try {
-      // Stage: reading
-      setTimeout(() => setStage("reading"), 400);
+      // 2. [STATEMENT CREATED]
+      const initialStatement: Statement = {
+        id: statementId,
+        user_id: authenticatedUserId,
+        file_name: file.name,
+        file_type: isPDF ? "pdf" : "csv",
+        uploaded_at: new Date().toISOString(),
+        processing_status: "processing",
+        created_at: new Date().toISOString(),
+      };
 
-      // Actual API call to server extraction engine
+      console.log(`[STATEMENT CREATED] Persisting initial statement record: ID=${statementId}, User=${authenticatedUserId}, Status=processing`);
+      await saveStatement(initialStatement);
+
+      setStage("reading");
+
+      // 3. [EXTRACTION VIA API]
+      const formData = new FormData();
+      formData.append("file", file);
+      formData.append("userId", authenticatedUserId);
+      formData.append("statementId", statementId);
+
+      setStage("extracting");
       const res = await fetch("/api/upload", {
         method: "POST",
         body: formData,
       });
 
-      setStage("extracting");
       const data = await res.json();
 
       if (!res.ok || data.error) {
-        setStage("error");
-        setErrorMessage(data.error || "Failed to process the statement. Please check file format.");
-        return;
+        throw new Error(data.error || "Failed to process the statement. Please check file format.");
       }
 
+      const extractedCount = data.transactions?.length || 0;
+      console.log(`[EXTRACTION COMPLETE] Statement ID: ${statementId}, Extracted transactions: ${extractedCount}`);
+
       setStage("cleaning");
-      await new Promise((r) => setTimeout(r, 450));
+      console.log(`[TRANSACTIONS NORMALIZED] Normalized transaction count: ${extractedCount}`);
 
       setStage("categorizing");
-      await new Promise((r) => setTimeout(r, 500));
 
+      // 4. [TRANSACTIONS INSERTED]
       setStage("calculating");
-      // Save statement & transactions
-      await saveStatement(data.statement);
-      await saveTransactionsBatch(data.transactions);
-      setParsedCount(data.transactions.length);
+      console.log(`[TRANSACTIONS INSERTED] Persisting ${extractedCount} transactions for statement ID: ${statementId}, user ID: ${authenticatedUserId}`);
+      const insertedCount = await saveTransactionsBatch(data.transactions);
+      setParsedCount(insertedCount);
 
+      // 5. [ANALYTICS COMPLETE]
+      const summary = calculateFinancialSummary(data.transactions);
+      const categories = calculateCategorySpending(data.transactions);
+      const reducible = detectPotentiallyReducibleSpending(data.transactions);
+      const recurring = detectRecurringPayments(data.transactions);
+      console.log(`[ANALYTICS COMPLETE] Statement ID: ${statementId}, Total income: ₹${summary.totalIncome}, Total expenses: ₹${summary.totalExpenses}, Categories: ${categories.length}`);
+
+      // 6. [AI ANALYSIS COMPLETE]
       setStage("generating");
-      await new Promise((r) => setTimeout(r, 600));
+      try {
+        await fetch("/api/ai/insights", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ summary, categories, reducible, recurring }),
+        });
+        console.log(`[AI ANALYSIS COMPLETE] Background AI insights generated`);
+      } catch (aiErr) {
+        console.warn("[AI ANALYSIS] AI insights generation note:", aiErr);
+      }
 
+      // 7. [PROCESSING COMPLETE]
+      await updateStatementStatus(statementId, "completed", {
+        period_start: data.periodStart || data.statement?.period_start,
+        period_end: data.periodEnd || data.statement?.period_end,
+        transaction_count: insertedCount,
+        total_spend: summary.totalExpenses,
+      });
+      console.log(`[PROCESSING COMPLETE] Statement ID: ${statementId}, User ID: ${authenticatedUserId}, Extracted transactions: ${extractedCount}, Inserted transactions: ${insertedCount}, Processing status: completed`);
+
+      // 8. DASHBOARD REDIRECT (Await completely before navigating!)
       setStage("complete");
-      setTimeout(() => {
-        router.push("/dashboard");
-      }, 1200);
+      router.refresh();
+      router.push("/dashboard");
     } catch (err: unknown) {
-      console.error(err);
+      console.error("[PIPELINE ERROR] Statement processing failed:", err);
+      // Mark statement as failed in database to preserve state
+      try {
+        await updateStatementStatus(statementId, "failed");
+        console.log(`[PROCESSING STATUS UPDATE] Statement ID: ${statementId} marked as failed due to error.`);
+      } catch (statusErr) {
+        console.error("[PIPELINE ERROR] Could not mark statement as failed:", statusErr);
+      }
       setStage("error");
-      setErrorMessage("Network error occurred during statement processing. Please try again.");
+      setErrorMessage(
+        err instanceof Error
+          ? err.message
+          : "An error occurred during statement processing. Please try again."
+      );
     }
   };
 

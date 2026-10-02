@@ -25,8 +25,12 @@ export default function UploadPage() {
 
     async function loadStatements() {
       if (!user) return;
-      const list = await fetchStatements(user.id);
-      setStatements(list);
+      try {
+        const list = await fetchStatements(user.id);
+        setStatements(list);
+      } catch (err) {
+        console.error("[UPLOAD PAGE] Failed to load statements:", err);
+      }
     }
 
     if (user) {

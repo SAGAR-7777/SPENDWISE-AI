@@ -1,53 +1,192 @@
-import { Statement, Transaction, Budget, UserPreferences, Category } from "@/types";
+import { Statement, Transaction, Budget, Category } from "@/types";
 import { isSupabaseConfigured, supabase } from "./supabase/client";
 
 const LOCAL_STATEMENTS_KEY = "spendwise_statements";
 const LOCAL_TRANSACTIONS_KEY = "spendwise_transactions";
 const LOCAL_BUDGET_KEY = "spendwise_budgets";
-const LOCAL_PREFS_KEY = "spendwise_prefs";
+
+export function isUUID(str: string): boolean {
+  if (!str || typeof str !== "string") return false;
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str);
+}
+
+/**
+ * Strips client-only properties and prepares a statement record matching
+ * public.statements columns strictly to avoid PostgREST PGRST204 errors.
+ */
+export function cleanStatementForDb(statement: Statement) {
+  return {
+    id: statement.id,
+    user_id: statement.user_id,
+    file_name: statement.file_name,
+    file_type: statement.file_type,
+    uploaded_at: statement.uploaded_at || new Date().toISOString(),
+    processing_status: statement.processing_status || "completed",
+    period_start: statement.period_start && statement.period_start.trim().length > 0 ? statement.period_start : null,
+    period_end: statement.period_end && statement.period_end.trim().length > 0 ? statement.period_end : null,
+    created_at: statement.created_at || new Date().toISOString(),
+  };
+}
+
+/**
+ * Strips client-only properties and prepares a transaction record matching
+ * public.transactions columns strictly.
+ */
+export function cleanTransactionForDb(tx: Transaction) {
+  return {
+    id: isUUID(tx.id) ? tx.id : crypto.randomUUID(),
+    user_id: tx.user_id,
+    statement_id: tx.statement_id,
+    date: tx.date,
+    description: tx.description || "Transaction",
+    merchant: tx.merchant || "Merchant",
+    amount: Math.max(0, Math.round(Number(tx.amount) * 100) / 100),
+    type: tx.type === "credit" ? "credit" : "debit",
+    category: tx.category || "Other",
+    payment_method: tx.payment_method || "UPI",
+    confidence: Math.min(1.0, Math.max(0, Number(tx.confidence) || 0.90)),
+    created_at: tx.created_at || new Date().toISOString(),
+  };
+}
 
 export async function fetchStatements(userId: string): Promise<Statement[]> {
-  if (isSupabaseConfigured && supabase) {
+  if (!userId) return [];
+
+  if (isSupabaseConfigured && supabase && isUUID(userId)) {
+    console.log(`[DASHBOARD FETCH] Querying Supabase statements for user: ${userId}`);
     const { data, error } = await supabase
       .from("statements")
       .select("*")
       .eq("user_id", userId)
       .order("uploaded_at", { ascending: false });
-    if (!error && data) return data as Statement[];
+
+    if (error) {
+      console.error("[DATABASE ERROR] Failed to fetch statements from Supabase:", error);
+      throw new Error(`Database query failed for statements: ${error.message} (${error.code || "UNKNOWN"})`);
+    }
+
+    console.log(`[DASHBOARD FETCH] Supabase returned ${data?.length || 0} statement(s) for user: ${userId}`);
+    return (data || []) as Statement[];
   }
 
-  // Local fallback
+  // Local storage fallback for local/demo accounts
   if (typeof window === "undefined") return [];
   try {
     const raw = localStorage.getItem(LOCAL_STATEMENTS_KEY);
     const all: Statement[] = raw ? JSON.parse(raw) : [];
-    return all.filter((s) => s.user_id === userId);
-  } catch {
+    const filtered = all.filter((s) => s.user_id === userId);
+    console.log(`[DASHBOARD FETCH] Local storage returned ${filtered.length} statement(s) for user: ${userId}`);
+    return filtered;
+  } catch (e) {
+    console.error("Local statements fetch error:", e);
     return [];
   }
 }
 
-export async function saveStatement(statement: Statement): Promise<void> {
-  if (isSupabaseConfigured && supabase) {
-    const { error } = await supabase.from("statements").insert([statement]);
-    if (!error) return;
+export async function saveStatement(statement: Statement): Promise<Statement> {
+  if (!statement.id || !statement.user_id) {
+    throw new Error("Cannot save statement: Missing required id or user_id.");
   }
 
-  if (typeof window === "undefined") return;
+  if (isSupabaseConfigured && supabase && isUUID(statement.user_id)) {
+    const dbRecord = cleanStatementForDb(statement);
+    console.log(`[DATABASE PERSISTENCE] Upserting statement record: ${dbRecord.id} for user: ${dbRecord.user_id}`);
+
+    const { data, error } = await supabase
+      .from("statements")
+      .upsert(dbRecord, { onConflict: "id" })
+      .select();
+
+    if (error) {
+      console.error("[DATABASE ERROR] Failed to insert/upsert statement:", error);
+      throw new Error(`Database error saving statement: ${error.message} (${error.code || "UNKNOWN"})`);
+    }
+
+    if (!data || !data[0] || !data[0].id) {
+      const err = new Error("Database returned no record after statement insertion.");
+      console.error("[DATABASE ERROR]", err);
+      throw err;
+    }
+
+    console.log(`[STATEMENT CREATED] Confirmed statement record persisted in database. Statement ID: ${data[0].id}, User ID: ${statement.user_id}`);
+    return { ...statement, id: data[0].id };
+  }
+
+  // Local storage fallback for demo or offline mode
+  if (typeof window === "undefined") return statement;
   try {
     const raw = localStorage.getItem(LOCAL_STATEMENTS_KEY);
     const all: Statement[] = raw ? JSON.parse(raw) : [];
     const filtered = all.filter((s) => s.id !== statement.id);
     filtered.unshift(statement);
     localStorage.setItem(LOCAL_STATEMENTS_KEY, JSON.stringify(filtered));
+    console.log(`[STATEMENT CREATED] Saved statement ${statement.id} to local storage.`);
+    return statement;
   } catch (e) {
     console.error("Local statement save error:", e);
+    throw e;
+  }
+}
+
+export async function updateStatementStatus(
+  statementId: string,
+  status: "uploading" | "processing" | "completed" | "failed",
+  extra?: { period_start?: string; period_end?: string; transaction_count?: number; total_spend?: number }
+): Promise<void> {
+  if (isSupabaseConfigured && supabase && isUUID(statementId)) {
+    const updatePayload: Record<string, unknown> = {
+      processing_status: status,
+    };
+    if (extra?.period_start && extra.period_start.trim().length > 0) {
+      updatePayload.period_start = extra.period_start;
+    }
+    if (extra?.period_end && extra.period_end.trim().length > 0) {
+      updatePayload.period_end = extra.period_end;
+    }
+
+    console.log(`[PROCESSING STATUS UPDATE] Updating statement ${statementId} status to: ${status}`);
+    const { error } = await supabase
+      .from("statements")
+      .update(updatePayload)
+      .eq("id", statementId);
+
+    if (error) {
+      console.error("[DATABASE ERROR] Failed to update statement processing status:", error);
+      throw new Error(`Database error updating statement status: ${error.message}`);
+    }
+  }
+
+  // Always sync local storage copy
+  if (typeof window === "undefined") return;
+  try {
+    const raw = localStorage.getItem(LOCAL_STATEMENTS_KEY);
+    const all: Statement[] = raw ? JSON.parse(raw) : [];
+    const updated = all.map((s) => {
+      if (s.id === statementId) {
+        return {
+          ...s,
+          processing_status: status,
+          ...(extra?.period_start ? { period_start: extra.period_start } : {}),
+          ...(extra?.period_end ? { period_end: extra.period_end } : {}),
+          ...(extra?.transaction_count !== undefined ? { transaction_count: extra.transaction_count } : {}),
+          ...(extra?.total_spend !== undefined ? { total_spend: extra.total_spend } : {}),
+        };
+      }
+      return s;
+    });
+    localStorage.setItem(LOCAL_STATEMENTS_KEY, JSON.stringify(updated));
+  } catch (e) {
+    console.error("Local status update error:", e);
   }
 }
 
 export async function deleteStatementCascade(statementId: string, userId: string): Promise<void> {
-  if (isSupabaseConfigured && supabase) {
-    await supabase.from("statements").delete().eq("id", statementId).eq("user_id", userId);
+  if (isSupabaseConfigured && supabase && isUUID(userId) && isUUID(statementId)) {
+    const { error } = await supabase.from("statements").delete().eq("id", statementId).eq("user_id", userId);
+    if (error) {
+      console.error("[DATABASE ERROR] Failed to cascade delete statement:", error);
+      throw new Error(`Database error deleting statement: ${error.message}`);
+    }
     return;
   }
 
@@ -69,36 +208,83 @@ export async function deleteStatementCascade(statementId: string, userId: string
 }
 
 export async function fetchTransactions(userId: string): Promise<Transaction[]> {
-  if (isSupabaseConfigured && supabase) {
+  if (!userId) return [];
+
+  if (isSupabaseConfigured && supabase && isUUID(userId)) {
+    console.log(`[DASHBOARD FETCH] Querying Supabase transactions for user: ${userId}`);
     const { data, error } = await supabase
       .from("transactions")
       .select("*")
       .eq("user_id", userId)
       .order("date", { ascending: false });
-    if (!error && data) return data as Transaction[];
+
+    if (error) {
+      console.error("[DATABASE ERROR] Failed to fetch transactions from Supabase:", error);
+      throw new Error(`Database query failed for transactions: ${error.message} (${error.code || "UNKNOWN"})`);
+    }
+
+    console.log(`[DASHBOARD FETCH] Supabase returned ${data?.length || 0} transaction(s) for user: ${userId}`);
+    return (data || []) as Transaction[];
   }
 
   if (typeof window === "undefined") return [];
   try {
     const raw = localStorage.getItem(LOCAL_TRANSACTIONS_KEY);
     const all: Transaction[] = raw ? JSON.parse(raw) : [];
-    return all
+    const filtered = all
       .filter((t) => t.user_id === userId)
       .sort((a, b) => (b.date > a.date ? 1 : -1));
-  } catch {
+    console.log(`[DASHBOARD FETCH] Local storage returned ${filtered.length} transaction(s) for user: ${userId}`);
+    return filtered;
+  } catch (e) {
+    console.error("Local transactions fetch error:", e);
     return [];
   }
 }
 
-export async function saveTransactionsBatch(transactions: Transaction[]): Promise<void> {
-  if (!transactions.length) return;
+export async function saveTransactionsBatch(transactions: Transaction[]): Promise<number> {
+  if (!transactions.length) return 0;
 
-  if (isSupabaseConfigured && supabase) {
-    const { error } = await supabase.from("transactions").insert(transactions);
-    if (!error) return;
+  const userId = transactions[0].user_id;
+  const statementId = transactions[0].statement_id;
+
+  // Validate integrity
+  for (const t of transactions) {
+    if (!t.user_id || !t.statement_id) {
+      const err = new Error("Database integrity failure: Transaction missing user_id or statement_id.");
+      console.error("[DATABASE ERROR]", err);
+      throw err;
+    }
   }
 
-  if (typeof window === "undefined") return;
+  if (isSupabaseConfigured && supabase && isUUID(userId)) {
+    const cleanTransactions = transactions.map(cleanTransactionForDb);
+    const batchSize = 100;
+    let totalInserted = 0;
+
+    console.log(`[DATABASE PERSISTENCE] Inserting ${cleanTransactions.length} transactions in batches of ${batchSize} for statement: ${statementId}`);
+
+    for (let i = 0; i < cleanTransactions.length; i += batchSize) {
+      const batch = cleanTransactions.slice(i, i + batchSize);
+      const { data, error } = await supabase
+        .from("transactions")
+        .insert(batch)
+        .select("id");
+
+      if (error) {
+        console.error("[DATABASE ERROR] Failed to insert transactions into Supabase:", error);
+        throw new Error(`Database error saving transactions: ${error.message} (${error.code || "UNKNOWN"})`);
+      }
+
+      totalInserted += (data?.length || batch.length);
+    }
+
+    console.log(`[TRANSACTIONS INSERTED] Statement ID: ${statementId}, User ID: ${userId}, Successfully inserted transactions: ${totalInserted}`);
+    return totalInserted;
+  }
+
+  // Local storage fallback for demo or offline mode
+  if (typeof window === "undefined") return 0;
   try {
     const raw = localStorage.getItem(LOCAL_TRANSACTIONS_KEY);
     const all: Transaction[] = raw ? JSON.parse(raw) : [];
@@ -106,8 +292,11 @@ export async function saveTransactionsBatch(transactions: Transaction[]): Promis
     const kept = all.filter((t) => !existingIds.has(t.id));
     const merged = [...transactions, ...kept];
     localStorage.setItem(LOCAL_TRANSACTIONS_KEY, JSON.stringify(merged));
+    console.log(`[TRANSACTIONS INSERTED] (Local) Statement ID: ${statementId}, Saved: ${transactions.length} transactions`);
+    return transactions.length;
   } catch (e) {
     console.error("Local transactions save error:", e);
+    throw e;
   }
 }
 
@@ -115,11 +304,15 @@ export async function updateTransactionCategory(
   transactionId: string,
   newCategory: Category
 ): Promise<void> {
-  if (isSupabaseConfigured && supabase) {
-    await supabase
+  if (isSupabaseConfigured && supabase && isUUID(transactionId)) {
+    const { error } = await supabase
       .from("transactions")
       .update({ category: newCategory })
       .eq("id", transactionId);
+    if (error) {
+      console.error("[DATABASE ERROR] Failed to update transaction category:", error);
+      throw new Error(`Database error updating category: ${error.message}`);
+    }
     return;
   }
 
@@ -137,8 +330,12 @@ export async function updateTransactionCategory(
 }
 
 export async function deleteTransactionById(transactionId: string): Promise<void> {
-  if (isSupabaseConfigured && supabase) {
-    await supabase.from("transactions").delete().eq("id", transactionId);
+  if (isSupabaseConfigured && supabase && isUUID(transactionId)) {
+    const { error } = await supabase.from("transactions").delete().eq("id", transactionId);
+    if (error) {
+      console.error("[DATABASE ERROR] Failed to delete transaction:", error);
+      throw new Error(`Database error deleting transaction: ${error.message}`);
+    }
     return;
   }
 
@@ -154,7 +351,7 @@ export async function deleteTransactionById(transactionId: string): Promise<void
 }
 
 export async function fetchBudget(userId: string): Promise<Budget | null> {
-  if (isSupabaseConfigured && supabase) {
+  if (isSupabaseConfigured && supabase && isUUID(userId)) {
     const { data, error } = await supabase
       .from("budgets")
       .select("*")
@@ -173,7 +370,7 @@ export async function fetchBudget(userId: string): Promise<Budget | null> {
 }
 
 export async function saveBudget(budget: Budget): Promise<void> {
-  if (isSupabaseConfigured && supabase) {
+  if (isSupabaseConfigured && supabase && isUUID(budget.user_id)) {
     await supabase.from("budgets").upsert(budget, { onConflict: "user_id" });
     return;
   }
@@ -187,7 +384,7 @@ export async function saveBudget(budget: Budget): Promise<void> {
 }
 
 export async function clearAllUserData(userId: string): Promise<void> {
-  if (isSupabaseConfigured && supabase) {
+  if (isSupabaseConfigured && supabase && isUUID(userId)) {
     await supabase.from("statements").delete().eq("user_id", userId);
     await supabase.from("budgets").delete().eq("user_id", userId);
     return;

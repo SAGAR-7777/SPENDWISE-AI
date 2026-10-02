@@ -99,10 +99,12 @@ export function parseStatementCSV(
 
     // 4. Determine Amount & Debit/Credit Type
     const debitKey = keys.find((k) =>
-      /withdrawal|debit|dr|spent|debit.?amount|withdrawal.?amount|dr.?amount/i.test(k)
+      /^(withdrawal|debit|dr|spent|debit.?amount|withdrawal.?amount|dr.?amount)$/i.test(k) ||
+      /\b(withdrawal|debit|spent)\b/i.test(k)
     );
     const creditKey = keys.find((k) =>
-      /deposit|credit|cr|received|credit.?amount|deposit.?amount|cr.?amount/i.test(k)
+      /^(deposit|credit|cr|received|credit.?amount|deposit.?amount|cr.?amount)$/i.test(k) ||
+      /\b(deposit|credit|received)\b/i.test(k)
     );
     const amountKey = keys.find((k) =>
       /^(amount|txn.?amount|transaction.?amount|inr|net.?amount)$/i.test(k)
