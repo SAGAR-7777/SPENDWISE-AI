@@ -17,7 +17,6 @@ export function isUUID(str: string): boolean {
 export function cleanStatementForDb(statement: Statement) {
   return {
     id: statement.id,
-    user_id: statement.user_id,
     file_name: statement.file_name,
     file_type: statement.file_type,
     uploaded_at: statement.uploaded_at || new Date().toISOString(),
